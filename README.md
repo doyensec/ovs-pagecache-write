@@ -5,7 +5,7 @@ datapath still mapped to its page-cache page, and the kernel writes into it.
 Arbitrary modification of any file the user can open for *reading* - here
 `/usr/bin/mount`.
 
-Write-up: TODO
+Write-up: https://blog.doyensec.com/2026/09/17/ovs.html
 
 ```
 [tbnz@ip-172-31-19-3 ovs-pagecache-write]$ id
